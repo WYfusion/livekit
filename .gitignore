@@ -11,3 +11,5 @@ KMS
 .pytest_cache
 .ruff_cache
 .claude/settings.local.json
+.github*
+pytest*

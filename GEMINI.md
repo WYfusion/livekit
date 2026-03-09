@@ -1,5 +1,7 @@
 # GEMINI.md
 
-This project uses `AGENTS.md` instead of a `GEMINI.md` file.
+本项目使用 `AGENTS.md` 作为统一说明文件，而不是单独维护一份 `GEMINI.md` 规则文档。
 
-Please see @./AGENTS.md in this same directory and treat its content as the primary reference for this project.
+如果修改 Python 文件且属于关键更改，请在被修改的 Python 文件最上方使用三引号备注，写明本次更改的技术细节。具体规则以同目录下的 @./AGENTS.md 为准。
+
+请查看 @./AGENTS.md，并将其中内容视为本项目的主参考说明。

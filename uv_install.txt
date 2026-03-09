@@ -1,0 +1,7 @@
+where uv
+
+winget --version
+
+winget install --id astral-sh.uv -e --source winget --accept-package-agreements --accept-source-agreements
+
+uv sync
