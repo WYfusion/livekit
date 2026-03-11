@@ -1,9 +1,9 @@
 '''更改的技术细节备注:
-1. 更改目的: 将测试入口接入阿里百炼模型, 并支持直接以脚本方式运行.
-2. 涉及文件或模块: tests/agent.py, env_utils.py, src/bailian_audio.py.
-3. 技术实现: 在文件顶部注入项目根目录到 sys.path; LLM 使用百炼 OpenAI 兼容接口; STT 与 TTS 使用自定义 DashScope 适配器.
-4. 兼容性影响: 保留 LiveKit AgentSession 入口形式, 但运行依赖百炼相关环境变量存在.
-5. 验证方式: python --help, py_compile, ruff check.
+1. 更改目的: 演示百炼 STT/TTS 适配器在 AgentSession 中显式开启流式接口, 并正确指定 TTS 音色与语言类型后的接入方式.
+2. 涉及文件或模块: tests/agent_turn_detection.py, src/bailian_audio.py, env_utils.py.
+3. 技术实现: 复用同一个 Silero VAD 同时作为 session 级 VAD 与 DashScopeSTT 的 stream_vad, 并为 DashScopeTTS 显式传入 Ethan 音色, Chinese 语言类型与 streaming=True.
+4. 兼容性影响: 仅调整示例脚本; 运行时仍依赖现有百炼环境变量与 LiveKit turn detector 配置.
+5. 验证方式: py_compile, 手动运行 tests/agent_turn_detection.py.
 '''
 
 # ruff: noqa: E402
@@ -24,6 +24,7 @@ from livekit.agents import (
     cli,
 )
 from livekit.plugins import noise_cancellation, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from env_utils import (
     ALIBABA_API_BASE_URL,
@@ -36,19 +37,21 @@ from src.bailian_audio import DashScopeSTT, DashScopeTTS
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="你是一个很有用的语音AI对话助手.",
+            instructions="你是一个很有用的语音 AI 对话助手, 要求回答简洁.",
         )
 
 
 async def entrypoint(ctx: JobContext):
+    shared_vad = silero.VAD.load()
+
     session = AgentSession(
-        # Bailian ASR and TTS use their native APIs rather than the LiveKit OpenAI
-        # STT/TTS plugin interfaces, so they need custom adapters here.
         stt=DashScopeSTT(
             model="qwen3-asr-flash",
             base_url=ALIBABA_COMPAT_BASE_URL,
             api_key=ALIBABA_API_KEY,
             language="zh",
+            streaming=True,
+            stream_vad=shared_vad,
         ),
         llm=openai.LLM(
             model="qwen3.5-plus-2026-02-15",
@@ -57,11 +60,15 @@ async def entrypoint(ctx: JobContext):
         ),
         tts=DashScopeTTS(
             model="qwen-tts",
-            voice="Cherry",
+            voice="Ethan",
+            language_type="Chinese",
+            # Voice list: https://bailian.console.alibabacloud.com/cn-beijing?tab=doc#/doc/?type=model&url=2879134
             base_url=ALIBABA_API_BASE_URL,
             api_key=ALIBABA_API_KEY,
+            streaming=True,
         ),
-        vad=silero.VAD.load(),
+        vad=shared_vad,
+        turn_detection=MultilingualModel(),
     )
 
     await session.start(

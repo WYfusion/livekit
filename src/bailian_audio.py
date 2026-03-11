@@ -1,10 +1,12 @@
 '''更改的技术细节备注:
-1. 更改目的: 为 LiveKit 提供阿里百炼 STT 与 TTS 的自定义适配层.
+1. 更改目的: 修正百炼 TTS 请求体结构, 解决自定义音色被静默回退为默认音色的问题, 并保留可选流式接口开关.
 2. 涉及文件或模块: src/bailian_audio.py.
-3. 技术实现: 封装 DashScopeSTT 与 DashScopeTTS; STT 使用兼容模式音频理解请求; TTS 使用百炼原生 HTTP 合成接口并回填音频流.
-4. 兼容性影响: 不依赖 LiveKit 内置 OpenAI STT/TTS 类型, 但依赖百炼接口字段与返回结构保持兼容.
+3. 技术实现: DashScopeSTT 在 streaming=True 时要求传入 stream_vad, 并委托 LiveKit 的 stt.StreamAdapter 暴露流式识别; DashScopeTTS 修正为按官方 API 将 voice 放入 input, 并支持显式 language_type; 开启 streaming=True 时仍委托 LiveKit 的 tts.StreamAdapter 暴露流式合成.
+4. 兼容性影响: 默认构造参数保持非流式行为; 开启流式后属于适配器包装的流式接口, 不等同于直接接入百炼原生实时协议.
 5. 验证方式: pytest tests/test_bailian_audio.py, ruff check, py_compile.
 '''
+
+from __future__ import annotations
 
 import base64
 from collections.abc import Sequence
@@ -22,6 +24,7 @@ from livekit.agents import (
     LanguageCode,
     stt,
     tts,
+    vad,
 )
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import AudioBuffer, is_given
@@ -124,13 +127,22 @@ def _build_tts_payload(
     text: str,
     voice: str,
     response_format: str,
+    sample_rate: int,
+    language_type: str | None = None,
 ) -> dict[str, Any]:
+    input_payload: dict[str, Any] = {
+        "text": text,
+        "voice": voice,
+    }
+    if language_type:
+        input_payload["language_type"] = language_type
+
     return {
         "model": model,
-        "input": {"text": text},
+        "input": input_payload,
         "parameters": {
-            "voice": voice,
-            "format": response_format,
+            "response_format": response_format,
+            "sample_rate": sample_rate,
         },
     }
 
@@ -174,6 +186,7 @@ class _DashScopeSTTOptions:
     model: str
     language: str
     prompt: str | None
+    streaming: bool
 
 
 class DashScopeSTT(stt.STT):
@@ -185,11 +198,16 @@ class DashScopeSTT(stt.STT):
         base_url: str = DEFAULT_COMPAT_BASE_URL,
         language: str = "zh",
         prompt: str | None = None,
+        streaming: bool = False,
+        stream_vad: vad.VAD | None = None,
         client: openai.AsyncClient | None = None,
     ) -> None:
+        if streaming and stream_vad is None:
+            raise ValueError("stream_vad is required when streaming=True")
+
         super().__init__(
             capabilities=stt.STTCapabilities(
-                streaming=False,
+                streaming=streaming,
                 interim_results=False,
                 aligned_transcript=False,
             )
@@ -198,7 +216,10 @@ class DashScopeSTT(stt.STT):
             model=model,
             language=language,
             prompt=prompt,
+            streaming=streaming,
         )
+        self._stream_vad = stream_vad
+        self._stream_adapter: stt.StreamAdapter | None = None
         self._owns_client = client is None
         self._client = client or openai.AsyncClient(
             api_key=api_key,
@@ -222,6 +243,13 @@ class DashScopeSTT(stt.STT):
     @property
     def provider(self) -> str:
         return "dashscope"
+
+    def _ensure_stream_adapter(self) -> stt.StreamAdapter:
+        if self._stream_adapter is None:
+            if self._stream_vad is None:
+                raise ValueError("stream_vad is required when streaming=True")
+            self._stream_adapter = stt.StreamAdapter(stt=self, vad=self._stream_vad)
+        return self._stream_adapter
 
     async def _recognize_impl(
         self,
@@ -274,7 +302,22 @@ class DashScopeSTT(stt.STT):
             ],
         )
 
+    def stream(
+        self,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.RecognizeStream:
+        if not self.capabilities.streaming:
+            return super().stream(language=language, conn_options=conn_options)
+        return self._ensure_stream_adapter().stream(
+            language=language,
+            conn_options=conn_options,
+        )
+
     async def aclose(self) -> None:
+        if self._stream_adapter is not None:
+            await self._stream_adapter.aclose()
         if self._owns_client:
             await self._client.close()
 
@@ -283,8 +326,10 @@ class DashScopeSTT(stt.STT):
 class _DashScopeTTSOptions:
     model: str
     voice: str
+    language_type: str | None
     response_format: str
     endpoint_path: str
+    streaming: bool
 
 
 class DashScopeTTS(tts.TTS):
@@ -293,25 +338,33 @@ class DashScopeTTS(tts.TTS):
         *,
         model: str = DEFAULT_TTS_MODEL,
         voice: str = DEFAULT_TTS_VOICE,
+        language_type: str | None = None,
         response_format: str = DEFAULT_TTS_FORMAT,
         api_key: str,
         base_url: str = DEFAULT_API_BASE_URL,
         endpoint_path: str = DEFAULT_TTS_ENDPOINT,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         num_channels: int = DEFAULT_NUM_CHANNELS,
+        streaming: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
+            capabilities=tts.TTSCapabilities(
+                streaming=streaming,
+                aligned_transcript=streaming,
+            ),
             sample_rate=sample_rate,
             num_channels=num_channels,
         )
         self._opts = _DashScopeTTSOptions(
             model=model,
             voice=voice,
+            language_type=language_type,
             response_format=response_format,
             endpoint_path=endpoint_path,
+            streaming=streaming,
         )
+        self._stream_adapter: tts.StreamAdapter | None = None
         self._base_url = _normalize_base_url(base_url, DEFAULT_API_BASE_URL)
         self._api_key = api_key
         self._owns_client = client is None
@@ -341,6 +394,11 @@ class DashScopeTTS(tts.TTS):
     def response_format(self) -> str:
         return self._opts.response_format
 
+    def _ensure_stream_adapter(self) -> tts.StreamAdapter:
+        if self._stream_adapter is None:
+            self._stream_adapter = tts.StreamAdapter(tts=self)
+        return self._stream_adapter
+
     def synthesize(
         self,
         text: str,
@@ -353,7 +411,18 @@ class DashScopeTTS(tts.TTS):
             conn_options=conn_options,
         )
 
+    def stream(
+        self,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> tts.SynthesizeStream:
+        if not self.capabilities.streaming:
+            return super().stream(conn_options=conn_options)
+        return self._ensure_stream_adapter().stream(conn_options=conn_options)
+
     async def aclose(self) -> None:
+        if self._stream_adapter is not None:
+            await self._stream_adapter.aclose()
         if self._owns_client:
             await self._client.aclose()
 
@@ -379,6 +448,8 @@ class _DashScopeChunkedStream(tts.ChunkedStream):
             text=self.input_text,
             voice=self._tts.voice,
             response_format=self._tts.response_format,
+            sample_rate=self._tts.sample_rate,
+            language_type=self._tts._opts.language_type,
         )
         endpoint = f"{self._tts._base_url}{self._tts._opts.endpoint_path}"
 

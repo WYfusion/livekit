@@ -5,3 +5,10 @@ winget --version
 winget install --id astral-sh.uv -e --source winget --accept-package-agreements --accept-source-agreements
 
 uv sync
+
+
+# 下载模型包
+uv run tests/agent.py download-files
+
+# 执行
+uv run tests/agent.py console

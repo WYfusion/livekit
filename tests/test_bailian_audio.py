@@ -1,12 +1,13 @@
 '''更改的技术细节备注:
-1. 更改目的: 为百炼音频适配层补充最小回归测试, 防止请求结构回退.
+1. 更改目的: 为百炼音频适配层补充流式开关的回归测试, 约束适配器包装行为.
 2. 涉及文件或模块: tests/test_bailian_audio.py, src/bailian_audio.py, env_utils.py.
-3. 技术实现: 覆盖音频 data URI, ASR extra_body, TTS payload, URL 推导与适配器实例化行为.
-4. 兼容性影响: 仅影响测试层, 不改变运行时行为.
+3. 技术实现: 继续覆盖 data URI, ASR/TTS 请求结构, 并新增 STT/TTS 在 streaming=True 时委托 LiveKit StreamAdapter 的测试.
+4. 兼容性影响: 仅影响测试层; 运行时默认仍保持非流式行为, 流式模式需显式开启.
 5. 验证方式: pytest tests/test_bailian_audio.py.
 '''
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from env_utils import _derive_api_base_url, _derive_compat_base_url
 from src.bailian_audio import (
@@ -65,16 +66,33 @@ def test_build_tts_payload_contains_voice_and_format() -> None:
         text="你好",
         voice="Cherry",
         response_format="wav",
+        sample_rate=24000,
     )
 
     assert payload == {
         "model": "qwen-tts",
-        "input": {"text": "你好"},
-        "parameters": {
+        "input": {
+            "text": "你好",
             "voice": "Cherry",
-            "format": "wav",
+        },
+        "parameters": {
+            "response_format": "wav",
+            "sample_rate": 24000,
         },
     }
+
+
+def test_build_tts_payload_includes_optional_language_type() -> None:
+    payload = _build_tts_payload(
+        model="qwen-tts",
+        text="hello",
+        voice="Ethan",
+        response_format="wav",
+        sample_rate=24000,
+        language_type="Chinese",
+    )
+
+    assert payload["input"]["language_type"] == "Chinese"
 
 
 def test_extract_tts_result_reads_nested_output() -> None:
@@ -102,19 +120,89 @@ def test_env_utils_derives_both_dashscope_base_urls() -> None:
 
 
 def test_dashscope_adapter_instances_expose_models() -> None:
-    stt = DashScopeSTT(
+    dashscope_stt = DashScopeSTT(
         model="qwen3-asr-flash",
         api_key="test-key",
         base_url="https://example.com/compatible-mode/v1",
     )
-    tts = DashScopeTTS(
+    dashscope_tts = DashScopeTTS(
         model="qwen-tts",
         voice="Cherry",
         api_key="test-key",
         base_url="https://example.com/api/v1",
     )
 
-    assert stt.model == "qwen3-asr-flash"
-    assert stt.capabilities.streaming is False
-    assert tts.model == "qwen-tts"
-    assert tts.voice == "Cherry"
+    assert dashscope_stt.model == "qwen3-asr-flash"
+    assert dashscope_stt.capabilities.streaming is False
+    assert dashscope_tts.model == "qwen-tts"
+    assert dashscope_tts.voice == "Cherry"
+    assert dashscope_tts.capabilities.streaming is False
+
+
+def test_dashscope_stt_requires_vad_when_streaming_enabled() -> None:
+    try:
+        DashScopeSTT(
+            model="qwen3-asr-flash",
+            api_key="test-key",
+            base_url="https://example.com/compatible-mode/v1",
+            streaming=True,
+        )
+    except ValueError as exc:
+        assert "stream_vad" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when stream_vad is missing")
+
+
+def test_dashscope_stt_stream_uses_livekit_stream_adapter(monkeypatch) -> None:
+    stream_vad = object()
+    adapter_calls: list[tuple[object, object]] = []
+    expected_stream = object()
+
+    class FakeStreamAdapter:
+        def __init__(self, *, stt, vad):
+            adapter_calls.append((stt, vad))
+            self.aclose = AsyncMock()
+
+        def stream(self, *, language=None, conn_options=None):
+            return expected_stream
+
+    monkeypatch.setattr("src.bailian_audio.stt.StreamAdapter", FakeStreamAdapter)
+
+    dashscope_stt = DashScopeSTT(
+        model="qwen3-asr-flash",
+        api_key="test-key",
+        base_url="https://example.com/compatible-mode/v1",
+        streaming=True,
+        stream_vad=stream_vad,
+    )
+
+    assert dashscope_stt.capabilities.streaming is True
+    assert dashscope_stt.stream() is expected_stream
+    assert adapter_calls == [(dashscope_stt, stream_vad)]
+
+
+def test_dashscope_tts_stream_uses_livekit_stream_adapter(monkeypatch) -> None:
+    adapter_calls: list[object] = []
+    expected_stream = object()
+
+    class FakeStreamAdapter:
+        def __init__(self, *, tts):
+            adapter_calls.append(tts)
+            self.aclose = AsyncMock()
+
+        def stream(self, *, conn_options=None):
+            return expected_stream
+
+    monkeypatch.setattr("src.bailian_audio.tts.StreamAdapter", FakeStreamAdapter)
+
+    dashscope_tts = DashScopeTTS(
+        model="qwen-tts",
+        voice="Cherry",
+        api_key="test-key",
+        base_url="https://example.com/api/v1",
+        streaming=True,
+    )
+
+    assert dashscope_tts.capabilities.streaming is True
+    assert dashscope_tts.stream() is expected_stream
+    assert adapter_calls == [dashscope_tts]
