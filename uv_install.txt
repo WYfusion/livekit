@@ -6,6 +6,9 @@ winget install --id astral-sh.uv -e --source winget --accept-package-agreements 
 
 uv sync
 
+uv add "livekit-agents[minimax]"
+
+uv add livekit-plugins-aliyun livekit-plugins-zhipu
 
 # 下载模型包
 uv run tests/agent.py download-files
